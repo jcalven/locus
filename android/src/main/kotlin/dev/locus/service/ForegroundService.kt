@@ -2,6 +2,7 @@ package dev.locus.service
 
 import android.annotation.TargetApi
 import android.app.Notification
+import android.content.Context
 import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.PendingIntent
@@ -60,9 +61,17 @@ class ForegroundService : Service() {
                 // so the OS won't kill us.
             }
         } else {
-            Log.e(TAG, "Attempted to start foreground service with null intent or extras.")
-            stopSelf(startId)
-            return START_NOT_STICKY
+            // Null intent means Android restarted the service after process death
+            // (START_STICKY). Restore notification from persisted config so the
+            // service stays alive, then dispatch a headless "restart" event so
+            // the Dart callback can re-initialize tracking and heartbeats.
+            val restored = restoreNotificationFromConfig()
+            if (!restored) {
+                Log.w(TAG, "No persisted config to restore, stopping service")
+                stopSelf(startId)
+                return START_NOT_STICKY
+            }
+            dispatchHeadlessRestartEvent()
         }
 
         return START_STICKY
@@ -130,6 +139,72 @@ class ForegroundService : Service() {
         }
 
         return builder.build()
+    }
+
+    /**
+     * Dispatches a headless "restart" event so the Dart callback knows
+     * tracking needs to be re-initialized after process death.
+     * Mirrors [BootReceiver]'s pattern for boot events.
+     */
+    private fun dispatchHeadlessRestartEvent() {
+        val prefs = applicationContext.getSharedPreferences(
+            "dev.locus.preferences", Context.MODE_PRIVATE
+        )
+        val dispatcher = prefs.getLong("bg_headless_dispatcher", 0L)
+        val callback = prefs.getLong("bg_headless_callback", 0L)
+        if (dispatcher == 0L || callback == 0L) return
+
+        val serviceIntent = Intent(applicationContext, HeadlessService::class.java).apply {
+            putExtra("dispatcher", dispatcher)
+            putExtra("callback", callback)
+            putExtra("event", "{\"type\":\"restart\"}")
+        }
+        HeadlessService.enqueueWork(applicationContext, serviceIntent)
+    }
+
+    /**
+     * Restores the foreground notification from persisted config after a
+     * null-intent restart (process death + START_STICKY). Returns false if
+     * no config was persisted (service was never properly started).
+     */
+    private fun restoreNotificationFromConfig(): Boolean {
+        val prefs = applicationContext.getSharedPreferences(
+            "dev.locus.preferences", Context.MODE_PRIVATE
+        )
+        val configJson = prefs.getString("bg_last_config", null) ?: return false
+        return try {
+            val config = org.json.JSONObject(configJson)
+            val notification = config.optJSONObject("notification")
+            val title = notification?.optString("title")
+                ?: config.optString("notificationTitle", "Locus")
+            val text = notification?.optString("text")
+                ?: config.optString("notificationText", "Tracking location in background.")
+
+            val restoredNotification = Notification.Builder(applicationContext, CHANNEL_ID)
+                .setContentTitle(title)
+                .setContentText(text)
+                .setOngoing(true)
+                .setSmallIcon(resolveIcon(notification?.optString("smallIcon")
+                    ?: config.optString("notificationSmallIcon")))
+                .build()
+
+            getSystemService(NotificationManager::class.java)
+                ?.notify(DEFAULT_NOTIFICATION_ID, restoredNotification)
+            true
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to restore notification from config: ${e.message}")
+            false
+        }
+    }
+
+    private fun resolveIcon(iconName: String?): Int {
+        val context = applicationContext
+        if (iconName != null) {
+            val icon = resources.getIdentifier(iconName, "drawable", context.packageName)
+            if (icon != 0) return icon
+        }
+        val launcher = resources.getIdentifier("ic_launcher", "mipmap", context.packageName)
+        return if (launcher != 0) launcher else FALLBACK_ICON
     }
 
     private fun promoteToForeground(id: Int, notification: Notification) {
